@@ -9,12 +9,10 @@ from playwright.async_api import (
     TimeoutError as PlaywrightTimeoutError,
 )
 
-from crawl_catalog import main as crawl_catalog_main
-
 
 app = FastAPI(
     title="Outfish Makanu Bridge",
-    version="0.4.0",
+    version="0.4.1",
 )
 
 BASE_URL = os.getenv(
@@ -217,12 +215,22 @@ async def open_logged_in_page():
 
     except HTTPException:
         if context:
-            await context.close()
+            try:
+                await context.close()
+            except Exception:
+                pass
 
         if browser:
-            await browser.close()
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
-        await playwright.stop()
+        try:
+            await playwright.stop()
+        except Exception:
+            pass
+
         raise
 
     except Exception as exc:
@@ -258,7 +266,7 @@ async def root():
     return {
         "service": "outfish-makanu-bridge",
         "status": "running",
-        "version": "0.4.0",
+        "version": "0.4.1",
     }
 
 
@@ -574,6 +582,10 @@ async def _run_catalog_crawl():
     _crawl_state["last_finished_at"] = None
 
     try:
+        # Import here, after app.py is fully loaded.
+        # crawl_catalog imports BASE_URL/open_logged_in_page from this module.
+        from crawl_catalog import main as crawl_catalog_main
+
         await crawl_catalog_main()
 
     except Exception as exc:
