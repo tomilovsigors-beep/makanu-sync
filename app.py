@@ -32,9 +32,9 @@ async def open_logged_in_page():
     password_field = page.locator('input[type="password"]').first
     if await password_field.count():
         form = password_field.locator("xpath=ancestor::form[1]")
-        login_field = form.locator(
-            'input:not([type="password"]):not([type="hidden"]):not([type="submit"]):not([type="button"])'
-        ).filter(visible=True).first
+login_field = form.locator(
+    'input:not([type="password"]):not([type="hidden"]):not([type="submit"]):not([type="button"]):visible'
+).first
 
         if not await login_field.count():
             login_field = page.locator(
