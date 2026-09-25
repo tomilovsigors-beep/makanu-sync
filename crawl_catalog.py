@@ -2,31 +2,44 @@ import asyncio
 import json
 import os
 import re
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse, urldefrag
 
 from app import BASE_URL, open_logged_in_page
 
-CATEGORY_ROOT = os.getenv("MAKANU_CATEGORY_ROOT", "/produkty")
 PAGE_TIMEOUT_MS = int(os.getenv("MAKANU_CRAWL_PAGE_TIMEOUT_MS", "60000"))
 NETWORK_IDLE_TIMEOUT_MS = int(os.getenv("MAKANU_CRAWL_NETWORK_IDLE_TIMEOUT_MS", "7000"))
-MAX_CATEGORIES = int(os.getenv("MAKANU_CRAWL_MAX_CATEGORIES", "200"))
+MAX_CANDIDATES = int(os.getenv("MAKANU_XML_MAX_CANDIDATES", "30"))
+MAX_PRODUCTS = int(os.getenv("MAKANU_XML_MAX_PRODUCTS", "20000"))
 
-PRICE_RE = re.compile(r"(\d{1,6}(?:[.,]\d{1,2})?)\s*(?:zł|PLN)", re.I)
-CODE_AT_END_RE = re.compile(r"\s([A-Z0-9][A-Z0-9._/\-]{2,39})\s*$", re.I)
+ALIASES = {
+    "sku": ("sku","symbol","code","kod","productcode","product_code","indeks","index"),
+    "ean": ("ean","ean13","barcode","gtin","gtin13"),
+    "title": ("name","title","productname","product_name","nazwa"),
+    "brand": ("brand","producer","manufacturer","marka","producent"),
+    "category": ("category","categoryname","category_name","kategoria"),
+    "price": ("price","netprice","net_price","wholesaleprice","wholesale_price","cena","cenanetto","cena_netto"),
+    "stock": ("stock","quantity","qty","availability","available","stan","stanmagazynowy","stan_magazynowy","ilosc","ilość"),
+    "image": ("image","imageurl","image_url","photo","picture","img","zdjecie","zdjęcie"),
+    "url": ("url","link","producturl","product_url","href"),
+}
 
 
 def emit(event, payload):
     print(json.dumps({
         "event": event,
         "ts": datetime.now(timezone.utc).isoformat(),
-        **payload,
+        **payload
     }, ensure_ascii=False, separators=(",", ":")), flush=True)
 
 
-def clean_url(url):
-    url, _ = urldefrag(url)
-    return url.strip()
+def local_name(tag):
+    return str(tag).split("}", 1)[-1].strip().lower()
+
+
+def clean(value):
+    return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
 def same_host(url):
@@ -36,374 +49,256 @@ def same_host(url):
         return False
 
 
-def parse_float(value):
-    if value is None:
+def parse_number(value):
+    s = clean(value).replace("\xa0", " ").replace("PLN", "").replace("zł", "")
+    s = re.sub(r"[^0-9,.-]", "", s)
+    if not s:
         return None
-    value = str(value).strip().replace(" ", "").replace(",", ".")
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".") if s.rfind(",") > s.rfind(".") else s.replace(",", "")
+    else:
+        s = s.replace(",", ".")
     try:
-        return float(value)
+        return float(s)
     except ValueError:
         return None
 
 
-def normalize_code(title, explicit_code):
-    if explicit_code:
-        return explicit_code.strip()
-    m = CODE_AT_END_RE.search(title or "")
-    return m.group(1).strip() if m else None
+def parse_stock(value):
+    s = clean(value).lower()
+    if not s:
+        return None
+    if s in {"true","yes","tak","available","in stock","dostępny","dostepny"}:
+        return 1
+    if s in {"false","no","nie","unavailable","out of stock","brak","niedostępny","niedostepny"}:
+        return 0
+    n = parse_number(s)
+    return max(0, int(n)) if n is not None else None
 
 
-def normalize_stock(raw):
-    text = " ".join([
-        str(raw.get("availability_text") or ""),
-        str(raw.get("card_text") or ""),
-        str(raw.get("availability_src") or ""),
-    ]).lower()
-
-    qty = None
-    for key in ("qty", "quantity", "stock", "available"):
-        v = raw.get(key)
-        if v is not None and str(v).strip().isdigit():
-            qty = int(str(v).strip())
-            break
-
-    if "s_brak" in text:
-        return "out_of_stock", 0
-    if "s_duzo" in text:
-        return "in_stock", qty
-    if re.search(r"\b(brak|niedostęp|niedostep|out of stock|unavailable)\b", text):
-        return "out_of_stock", 0
-    if re.search(r"\b(dostęp|dostep|available|in stock)\b", text):
-        return "in_stock", qty
-    return "unknown", qty
+def flatten(elem):
+    out = {}
+    for k, v in elem.attrib.items():
+        if clean(v):
+            out.setdefault(local_name(k), clean(v))
+    for child in list(elem):
+        key = local_name(child.tag)
+        if len(list(child)) == 0 and clean(child.text):
+            out.setdefault(key, clean(child.text))
+        for k, v in child.attrib.items():
+            if clean(v):
+                out.setdefault(f"{key}_{local_name(k)}", clean(v))
+    return out
 
 
-async def discover_categories(page):
-    await page.goto(
-        urljoin(BASE_URL, CATEGORY_ROOT),
-        wait_until="domcontentloaded",
-        timeout=PAGE_TIMEOUT_MS,
-    )
+def first(flat, aliases):
+    for a in aliases:
+        if clean(flat.get(a)):
+            return clean(flat[a])
+    return ""
+
+
+def looks_like_xml_catalog(text):
+    low = (text or "")[:15000].lower()
+    if not low.lstrip().startswith("<"):
+        return False
+    hints = ("<product","<item","<offer","<towar","<produkt","<name","<nazwa","<price","<cena","<sku","<ean")
+    return sum(h in low for h in hints) >= 2
+
+
+def choose_product_elements(root):
+    scored = []
+    for elem in root.iter():
+        if not list(elem):
+            continue
+        flat = flatten(elem)
+        score = 0
+        score += 3 if first(flat, ALIASES["title"]) else 0
+        score += 3 if first(flat, ALIASES["sku"]) else 0
+        score += 2 if first(flat, ALIASES["ean"]) else 0
+        score += 3 if first(flat, ALIASES["price"]) else 0
+        score += 2 if first(flat, ALIASES["stock"]) else 0
+        if any(x in local_name(elem.tag) for x in ("product","item","offer","towar","produkt")):
+            score += 2
+        if score >= 6:
+            scored.append((score, local_name(elem.tag), elem, flat))
+    if not scored:
+        return []
+    best = max(x[0] for x in scored)
+    chosen = [x for x in scored if x[0] >= max(6, best - 2)]
+    counts = {}
+    for _, tag, _, _ in chosen:
+        counts[tag] = counts.get(tag, 0) + 1
+    if counts:
+        tag, count = max(counts.items(), key=lambda x: x[1])
+        if count >= 3:
+            chosen = [x for x in chosen if x[1] == tag]
+    return [(elem, flat) for _, _, elem, flat in chosen]
+
+
+def normalize(flat, feed_url):
+    p = {
+        "brand": first(flat, ALIASES["brand"]) or None,
+        "category": first(flat, ALIASES["category"]) or None,
+        "title": first(flat, ALIASES["title"]) or None,
+        "supplier_sku": first(flat, ALIASES["sku"]) or None,
+        "ean": first(flat, ALIASES["ean"]) or None,
+        "wholesale_price_pln": parse_number(first(flat, ALIASES["price"])),
+        "stock_qty": parse_stock(first(flat, ALIASES["stock"])),
+        "stock_raw": first(flat, ALIASES["stock"]) or None,
+        "source_url": first(flat, ALIASES["url"]) or feed_url,
+        "image_url": first(flat, ALIASES["image"]) or None,
+        "xml_feed_url": feed_url,
+    }
+    if p["source_url"]:
+        p["source_url"] = urljoin(BASE_URL, p["source_url"])
+    if p["image_url"]:
+        p["image_url"] = urljoin(BASE_URL, p["image_url"])
+    return p
+
+
+async def fetch(context, url):
     try:
-        await page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT_MS)
-    except Exception:
-        pass
-
-    links = await page.locator("a").evaluate_all("""
-        els => els.map(a => ({
-            text: (a.innerText || "").trim(),
-            href: a.href || ""
-        }))
-    """)
-
-    categories = []
-    seen = set()
-
-    for item in links:
-        href = clean_url(item.get("href") or "")
-        if not href or not same_host(href):
-            continue
-
-        parts = urlparse(href).path.strip("/").split("/")
-        if len(parts) != 3 or parts[0] != "products":
-            continue
-        if href in seen:
-            continue
-
-        seen.add(href)
-        categories.append({
-            "url": href,
-            "brand": parts[1].replace("-", " "),
-            "category": parts[2].replace("-", " "),
-        })
-
-    categories.sort(key=lambda x: (x["brand"].lower(), x["category"].lower()))
-    return categories[:MAX_CATEGORIES]
-
-
-async def extract_products_from_category(page, category):
-    raw_products = await page.evaluate(r"""
-        () => {
-            const priceRe = /(\d{1,6}(?:[.,]\d{1,2})?)\s*(?:zł|PLN)/i;
-
-            const clean = s => (s || "").replace(/\s+/g, " ").trim();
-
-            function collectAttrs(el) {
-                const out = {};
-                if (!el) return out;
-                for (const a of Array.from(el.attributes || [])) {
-                    const k = a.name.toLowerCase();
-                    if (
-                        k.includes("stock") ||
-                        k.includes("qty") ||
-                        k.includes("quantity") ||
-                        k.includes("available") ||
-                        k.includes("product") ||
-                        k.includes("code") ||
-                        k.includes("sku")
-                    ) out[k] = a.value;
-                }
-                return out;
-            }
-
-            function cardFromControl(control) {
-                let node = control;
-                let best = null;
-
-                for (let depth = 0; node && depth < 8; depth++, node = node.parentElement) {
-                    const t = clean(node.innerText || node.textContent || "");
-                    if (!priceRe.test(t)) continue;
-
-                    const links = Array.from(node.querySelectorAll("a"));
-                    const imgs = Array.from(node.querySelectorAll("img"));
-                    const inputs = Array.from(node.querySelectorAll("input"));
-
-                    const score =
-                        (imgs.some(img => (img.currentSrc || img.src || "").includes("/_data/products/")) ? 3 : 0) +
-                        (links.length > 0 ? 1 : 0) +
-                        (t.length < 2200 ? 2 : 0);
-
-                    if (!best || score > best.score) best = {node, t, links, imgs, inputs, score};
-                    if (score >= 5) break;
-                }
-
-                if (!best) return null;
-
-                const priceMatch = best.t.match(priceRe);
-                const image = best.imgs.find(img =>
-                    (img.currentSrc || img.src || "").includes("/_data/products/")
-                );
-                const availabilityImage = best.imgs.find(img => {
-                    const src = img.currentSrc || img.src || "";
-                    return src.includes("s_duzo") || src.includes("s_brak");
-                });
-
-                const titleCandidates = best.links
-                    .map(a => clean(a.innerText || a.textContent || ""))
-                    .filter(v =>
-                        v &&
-                        !/^add to cart$/i.test(v) &&
-                        !/^home$/i.test(v) &&
-                        !/^[0-9]+$/.test(v) &&
-                        !priceRe.test(v)
-                    )
-                    .sort((a,b) => b.length - a.length);
-
-                let title = titleCandidates[0] || "";
-                if (!title) {
-                    const lines = (best.node.innerText || "")
-                        .split(/\n+/)
-                        .map(v => v.trim())
-                        .filter(Boolean);
-                    title = lines.find(v =>
-                        !priceRe.test(v) &&
-                        !/^availability:?$/i.test(v) &&
-                        !/^szt\.?$/i.test(v) &&
-                        !/^add to cart$/i.test(v)
-                    ) || "";
-                }
-
-                let href = "";
-                for (const a of best.links) {
-                    const at = clean(a.innerText || a.textContent || "");
-                    if (at === title) {
-                        href = a.href || "";
-                        break;
-                    }
-                }
-
-                const attrs = {...collectAttrs(best.node), ...collectAttrs(control)};
-                const explicitCode =
-                    attrs["data-sku"] ||
-                    attrs["data-code"] ||
-                    attrs["data-product-code"] ||
-                    attrs["sku"] ||
-                    attrs["code"] ||
-                    "";
-
-                let qty = null, quantity = null, stock = null, available = null;
-                for (const inp of best.inputs) {
-                    const name = (inp.name || inp.id || "").toLowerCase();
-                    const value = inp.value;
-                    if (name.includes("qty")) qty = value;
-                    if (name.includes("quantity")) quantity = value;
-                    if (name.includes("stock")) stock = value;
-                    if (name.includes("available")) available = value;
-                }
-
-                return {
-                    title,
-                    product_href: href,
-                    image_url: image ? (image.currentSrc || image.src || "") : "",
-                    availability_src: availabilityImage ? (availabilityImage.currentSrc || availabilityImage.src || "") : "",
-                    price_text: priceMatch ? priceMatch[1] : "",
-                    explicit_code: explicitCode,
-                    qty,
-                    quantity,
-                    stock,
-                    available,
-                    availability_text: best.t,
-                    card_text: best.t.slice(0, 1200),
-                };
-            }
-
-            const controls = Array.from(
-                document.querySelectorAll('button, input[type="submit"], input[type="button"], a')
-            ).filter(el => {
-                const v = clean(el.innerText || el.value || el.textContent || "");
-                return /add to cart/i.test(v);
-            });
-
-            const results = [];
-            const seen = new Set();
-
-            for (const control of controls) {
-                const item = cardFromControl(control);
-                if (!item) continue;
-
-                const key = [item.title, item.price_text, item.product_href, item.image_url].join("|");
-                if (seen.has(key)) continue;
-                seen.add(key);
-                results.push(item);
-            }
-
-            return results;
+        r = await context.request.get(url, timeout=PAGE_TIMEOUT_MS, fail_on_status_code=False)
+        return {
+            "ok": r.ok,
+            "status": r.status,
+            "url": r.url,
+            "content_type": r.headers.get("content-type", ""),
+            "text": await r.text(),
         }
-    """)
+    except Exception as exc:
+        return {"ok": False, "status": None, "url": url, "content_type": "", "text": "", "error": type(exc).__name__}
 
-    products = []
-    for raw in raw_products:
-        title = (raw.get("title") or "").strip()
-        price_pln = parse_float(raw.get("price_text"))
 
-        if not title or price_pln is None:
-            continue
+async def discover_links(page, url):
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT_MS)
+        except Exception:
+            pass
+        links = await page.locator("a").evaluate_all("""
+            els => els.map(a => ({
+                text:(a.innerText || a.textContent || "").trim(),
+                href:a.href || ""
+            }))
+        """)
+    except Exception:
+        return []
 
-        stock_status, stock_qty = normalize_stock(raw)
-
-        products.append({
-            "brand": category["brand"],
-            "category": category["category"],
-            "title": title,
-            "supplier_sku": normalize_code(title, raw.get("explicit_code")),
-            "ean": None,
-            "wholesale_price_pln": price_pln,
-            "stock_status": stock_status,
-            "stock_qty": stock_qty,
-            "source_url": raw.get("product_href") or category["url"],
-            "category_url": category["url"],
-            "image_url": raw.get("image_url") or None,
-            "availability_icon": raw.get("availability_src") or None,
-        })
-
-    return products
+    out = []
+    for item in links:
+        href, _ = urldefrag(item.get("href") or "")
+        label = clean(item.get("text"))
+        probe = f"{label} {href}".lower()
+        if href and same_host(href) and (
+            "xml" in probe or "feed" in probe or "export" in probe or
+            href.lower().endswith(".xml") or "format=xml" in href.lower()
+        ):
+            out.append({"url": href, "label": label})
+    return out
 
 
 async def main():
     playwright = browser = context = None
-
     try:
         playwright, browser, context, page = await open_logged_in_page()
-        categories = await discover_categories(page)
 
-        emit("crawl_start", {
-            "mode": "category_fast",
-            "categories_found": len(categories),
-        })
+        queue = await discover_links(page, urljoin(BASE_URL, "/pulpit"))
+        for path in ("/xml", "/XML", "/oferta", "/export", "/feed"):
+            queue.append({"url": urljoin(BASE_URL, path), "label": path})
 
-        total_products = 0
-        in_stock = 0
-        out_of_stock = 0
-        unknown_stock = 0
-        category_errors = 0
-        emitted = set()
+        emit("xml_discovery_start", {"candidates_found": len(queue), "candidates": queue[:30]})
 
-        for index, category in enumerate(categories, start=1):
-            emit("category_begin", {
-                "category_number": index,
-                "categories_total": len(categories),
-                "brand": category["brand"],
-                "category": category["category"],
-                "url": category["url"],
+        seen = set()
+        products = []
+        product_keys = set()
+
+        while queue and len(seen) < MAX_CANDIDATES:
+            item = queue.pop(0)
+            url = item["url"]
+            if not url or url in seen:
+                continue
+            seen.add(url)
+
+            result = await fetch(context, url)
+            text = result.get("text") or ""
+            is_xml = looks_like_xml_catalog(text)
+
+            emit("xml_candidate", {
+                "url": url,
+                "label": item.get("label"),
+                "status": result.get("status"),
+                "content_type": result.get("content_type"),
+                "bytes": len(text),
+                "looks_like_xml_catalog": is_xml,
             })
 
-            try:
-                await page.goto(
-                    category["url"],
-                    wait_until="domcontentloaded",
-                    timeout=PAGE_TIMEOUT_MS,
-                )
-
+            if result.get("ok") and is_xml:
                 try:
-                    await page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT_MS)
-                except Exception:
-                    pass
+                    root = ET.fromstring(text)
+                except ET.ParseError as exc:
+                    emit("xml_parse_error", {"url": url, "error": str(exc)[:300]})
+                    continue
 
-                products = await extract_products_from_category(page, category)
-                found_here = 0
+                elems = choose_product_elements(root)
+                emit("xml_schema", {
+                    "url": result.get("url") or url,
+                    "root_tag": local_name(root.tag),
+                    "candidate_elements": len(elems),
+                })
 
-                for product in products:
-                    key = (
-                        product.get("supplier_sku"),
-                        product.get("title"),
-                        product.get("wholesale_price_pln"),
-                        product.get("image_url"),
-                    )
-                    if key in emitted:
+                for _, flat in elems[:MAX_PRODUCTS]:
+                    p = normalize(flat, result.get("url") or url)
+                    if not (p["title"] or p["supplier_sku"] or p["ean"]):
                         continue
-                    emitted.add(key)
+                    if p["wholesale_price_pln"] is None and p["stock_qty"] is None:
+                        continue
 
-                    total_products += 1
-                    found_here += 1
+                    key = (p["supplier_sku"], p["ean"], p["title"], p["source_url"])
+                    if key in product_keys:
+                        continue
+                    product_keys.add(key)
+                    products.append(p)
+                    emit("product", {"product": p})
 
-                    if product["stock_status"] == "in_stock":
-                        in_stock += 1
-                    elif product["stock_status"] == "out_of_stock":
-                        out_of_stock += 1
-                    else:
-                        unknown_stock += 1
+                if products:
+                    emit("crawl_summary", {
+                        "ok": True,
+                        "mode": "xml",
+                        "xml_feed_url": result.get("url") or url,
+                        "xml_candidates_checked": len(seen),
+                        "products_found": len(products),
+                        "products_with_sku": sum(bool(p["supplier_sku"]) for p in products),
+                        "products_with_ean": sum(bool(p["ean"]) for p in products),
+                        "products_with_price": sum(p["wholesale_price_pln"] is not None for p in products),
+                        "products_with_stock": sum(p["stock_qty"] is not None for p in products),
+                        "zero_stock_products": sum(p["stock_qty"] == 0 for p in products),
+                    })
+                    return
 
-                    emit("product", {"product": product})
-
-                emit("category_done", {
-                    "category_number": index,
-                    "categories_total": len(categories),
-                    "brand": category["brand"],
-                    "category": category["category"],
-                    "products_found": found_here,
-                    "total_products": total_products,
-                })
-
-            except Exception as exc:
-                category_errors += 1
-                emit("category_error", {
-                    "category_number": index,
-                    "categories_total": len(categories),
-                    "brand": category["brand"],
-                    "category": category["category"],
-                    "url": category["url"],
-                    "error_type": type(exc).__name__,
-                })
+            if result.get("ok") and "html" in (result.get("content_type") or "").lower():
+                for extra in await discover_links(page, result.get("url") or url):
+                    if extra["url"] not in seen:
+                        queue.append(extra)
 
         emit("crawl_summary", {
-            "ok": category_errors == 0,
-            "mode": "category_fast",
-            "categories_found": len(categories),
-            "categories_with_errors": category_errors,
-            "products_found": total_products,
-            "in_stock_products": in_stock,
-            "out_of_stock_products": out_of_stock,
-            "unknown_stock_products": unknown_stock,
+            "ok": False,
+            "mode": "xml",
+            "xml_candidates_checked": len(seen),
+            "products_found": len(products),
+            "reason": "No parseable product XML feed found",
         })
 
     except Exception as exc:
         emit("crawl_fatal", {
             "ok": False,
-            "mode": "category_fast",
+            "mode": "xml",
             "error_type": type(exc).__name__,
+            "error": str(exc)[:500],
         })
         raise
-
     finally:
         if context:
             await context.close()
