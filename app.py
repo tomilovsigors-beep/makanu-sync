@@ -3,7 +3,8 @@ import os
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
 
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Security
+from fastapi.security import APIKeyHeader
 from playwright.async_api import (
     async_playwright,
     TimeoutError as PlaywrightTimeoutError,
@@ -12,7 +13,10 @@ from playwright.async_api import (
 
 app = FastAPI(
     title="Outfish Makanu Bridge",
-    version="0.4.1",
+    version="0.5.0",
+    swagger_ui_parameters={
+        "persistAuthorization": True,
+    },
 )
 
 BASE_URL = os.getenv(
@@ -31,8 +35,19 @@ BRIDGE_API_KEY = os.getenv("BRIDGE_API_KEY", "")
 
 
 # ---------------------------------------------------------
-# AUTHORIZATION
+# SWAGGER / API KEY AUTHORIZATION
 # ---------------------------------------------------------
+
+api_key_header = APIKeyHeader(
+    name="x-api-key",
+    scheme_name="Bridge API key",
+    description=(
+        "Enter BRIDGE_API_KEY once here. "
+        "Swagger will reuse it automatically for protected requests."
+    ),
+    auto_error=False,
+)
+
 
 def authorize(x_api_key: str | None):
     if not BRIDGE_API_KEY:
@@ -266,7 +281,8 @@ async def root():
     return {
         "service": "outfish-makanu-bridge",
         "status": "running",
-        "version": "0.4.1",
+        "version": "0.5.0",
+        "swagger_auth": "Authorize once with x-api-key",
     }
 
 
@@ -279,6 +295,7 @@ async def health():
     return {
         "ok": True,
         "service": "outfish-makanu-bridge",
+        "version": "0.5.0",
     }
 
 
@@ -288,7 +305,7 @@ async def health():
 
 @app.get("/probe")
 async def probe(
-    x_api_key: str | None = Header(default=None),
+    x_api_key: str | None = Security(api_key_header),
 ):
     authorize(x_api_key)
 
@@ -347,7 +364,7 @@ async def probe(
 
 @app.get("/login-form")
 async def login_form(
-    x_api_key: str | None = Header(default=None),
+    x_api_key: str | None = Security(api_key_header),
 ):
     authorize(x_api_key)
 
@@ -431,7 +448,7 @@ async def login_form(
 
 @app.get("/login-check")
 async def login_check(
-    x_api_key: str | None = Header(default=None),
+    x_api_key: str | None = Security(api_key_header),
 ):
     authorize(x_api_key)
 
@@ -478,7 +495,7 @@ async def login_check(
 @app.get("/page")
 async def page_text(
     path: str = Query(default="/pulpit"),
-    x_api_key: str | None = Header(default=None),
+    x_api_key: str | None = Security(api_key_header),
 ):
     authorize(x_api_key)
 
@@ -602,7 +619,7 @@ async def _run_catalog_crawl():
 
 @app.post("/crawl-start")
 async def crawl_start(
-    x_api_key: str | None = Header(default=None),
+    x_api_key: str | None = Security(api_key_header),
 ):
     global _crawl_task
 
@@ -630,7 +647,7 @@ async def crawl_start(
 
 @app.get("/crawl-status")
 async def crawl_status(
-    x_api_key: str | None = Header(default=None),
+    x_api_key: str | None = Security(api_key_header),
 ):
     authorize(x_api_key)
 
