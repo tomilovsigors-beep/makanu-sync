@@ -4,14 +4,15 @@ import os
 import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse, urldefrag
+from urllib.parse import urljoin, urlparse
 
 from app import BASE_URL, open_logged_in_page
 
 PAGE_TIMEOUT_MS = int(os.getenv("MAKANU_CRAWL_PAGE_TIMEOUT_MS", "60000"))
 NETWORK_IDLE_TIMEOUT_MS = int(os.getenv("MAKANU_CRAWL_NETWORK_IDLE_TIMEOUT_MS", "7000"))
-MAX_CANDIDATES = int(os.getenv("MAKANU_XML_MAX_CANDIDATES", "30"))
-MAX_PRODUCTS = int(os.getenv("MAKANU_XML_MAX_PRODUCTS", "20000"))
+
+XML_PAGE = "/xml.html"
+KNOWN_XML_FEED = "/p/Exporter/Index/xml"
 
 ALIASES = {
     "sku": ("sku","symbol","code","kod","productcode","product_code","indeks","index"),
@@ -20,10 +21,19 @@ ALIASES = {
     "brand": ("brand","producer","manufacturer","marka","producent"),
     "category": ("category","categoryname","category_name","kategoria"),
     "price": ("price","netprice","net_price","wholesaleprice","wholesale_price","cena","cenanetto","cena_netto"),
-    "stock": ("stock","quantity","qty","availability","available","stan","stanmagazynowy","stan_magazynowy","ilosc","ilość"),
+    "stock": ("stock","quantity","qty","availability","available","stan","stanmagazynowy","stan_magazynowy","ilosc","ilość","magazyn"),
     "image": ("image","imageurl","image_url","photo","picture","img","zdjecie","zdjęcie"),
     "url": ("url","link","producturl","product_url","href"),
 }
+
+STOCK_HINTS = (
+    "stock","qty","quantity","availability","available",
+    "stan","magazyn","ilosc","ilość","inventory"
+)
+
+EXPORT_HINTS = (
+    "xml","csv","xls","xlsx","export","feed","offer","oferta"
+)
 
 
 def emit(event, payload):
@@ -34,12 +44,12 @@ def emit(event, payload):
     }, ensure_ascii=False, separators=(",", ":")), flush=True)
 
 
+def clean(v):
+    return re.sub(r"\s+", " ", str(v or "")).strip()
+
+
 def local_name(tag):
     return str(tag).split("}", 1)[-1].strip().lower()
-
-
-def clean(value):
-    return re.sub(r"\s+", " ", str(value or "")).strip()
 
 
 def same_host(url):
@@ -98,14 +108,6 @@ def first(flat, aliases):
     return ""
 
 
-def looks_like_xml_catalog(text):
-    low = (text or "")[:15000].lower()
-    if not low.lstrip().startswith("<"):
-        return False
-    hints = ("<product","<item","<offer","<towar","<produkt","<name","<nazwa","<price","<cena","<sku","<ean")
-    return sum(h in low for h in hints) >= 2
-
-
 def choose_product_elements(root):
     scored = []
     for elem in root.iter():
@@ -117,7 +119,7 @@ def choose_product_elements(root):
         score += 3 if first(flat, ALIASES["sku"]) else 0
         score += 2 if first(flat, ALIASES["ean"]) else 0
         score += 3 if first(flat, ALIASES["price"]) else 0
-        score += 2 if first(flat, ALIASES["stock"]) else 0
+        score += 3 if first(flat, ALIASES["stock"]) else 0
         if any(x in local_name(elem.tag) for x in ("product","item","offer","towar","produkt")):
             score += 2
         if score >= 6:
@@ -137,7 +139,13 @@ def choose_product_elements(root):
 
 
 def normalize(flat, feed_url):
-    p = {
+    source = first(flat, ALIASES["url"]) or feed_url
+    image = first(flat, ALIASES["image"]) or None
+    if source:
+        source = urljoin(BASE_URL, source)
+    if image:
+        image = urljoin(BASE_URL, image)
+    return {
         "brand": first(flat, ALIASES["brand"]) or None,
         "category": first(flat, ALIASES["category"]) or None,
         "title": first(flat, ALIASES["title"]) or None,
@@ -146,20 +154,27 @@ def normalize(flat, feed_url):
         "wholesale_price_pln": parse_number(first(flat, ALIASES["price"])),
         "stock_qty": parse_stock(first(flat, ALIASES["stock"])),
         "stock_raw": first(flat, ALIASES["stock"]) or None,
-        "source_url": first(flat, ALIASES["url"]) or feed_url,
-        "image_url": first(flat, ALIASES["image"]) or None,
+        "source_url": source,
+        "image_url": image,
         "xml_feed_url": feed_url,
     }
-    if p["source_url"]:
-        p["source_url"] = urljoin(BASE_URL, p["source_url"])
-    if p["image_url"]:
-        p["image_url"] = urljoin(BASE_URL, p["image_url"])
-    return p
 
 
-async def fetch(context, url):
+async def fetch(context, url, method="GET", data=None):
     try:
-        r = await context.request.get(url, timeout=PAGE_TIMEOUT_MS, fail_on_status_code=False)
+        if method.upper() == "POST":
+            r = await context.request.post(
+                url,
+                form=data or {},
+                timeout=PAGE_TIMEOUT_MS,
+                fail_on_status_code=False,
+            )
+        else:
+            r = await context.request.get(
+                url,
+                timeout=PAGE_TIMEOUT_MS,
+                fail_on_status_code=False,
+            )
         return {
             "ok": r.ok,
             "status": r.status,
@@ -168,133 +183,247 @@ async def fetch(context, url):
             "text": await r.text(),
         }
     except Exception as exc:
-        return {"ok": False, "status": None, "url": url, "content_type": "", "text": "", "error": type(exc).__name__}
+        return {
+            "ok": False,
+            "status": None,
+            "url": url,
+            "content_type": "",
+            "text": "",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 
 
-async def discover_links(page, url):
+def analyze_text_for_stock(text):
+    low = (text or "").lower()
+    found = [h for h in STOCK_HINTS if h in low]
+    return sorted(set(found))
+
+
+async def inspect_xml_page(page):
+    url = urljoin(BASE_URL, XML_PAGE)
+    await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
-        try:
-            await page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT_MS)
-        except Exception:
-            pass
-        links = await page.locator("a").evaluate_all("""
-            els => els.map(a => ({
-                text:(a.innerText || a.textContent || "").trim(),
-                href:a.href || ""
-            }))
-        """)
+        await page.wait_for_load_state("networkidle", timeout=NETWORK_IDLE_TIMEOUT_MS)
     except Exception:
-        return []
+        pass
 
-    out = []
-    for item in links:
-        href, _ = urldefrag(item.get("href") or "")
-        label = clean(item.get("text"))
-        probe = f"{label} {href}".lower()
-        if href and same_host(href) and (
-            "xml" in probe or "feed" in probe or "export" in probe or
-            href.lower().endswith(".xml") or "format=xml" in href.lower()
-        ):
-            out.append({"url": href, "label": label})
-    return out
+    data = await page.evaluate("""
+    () => {
+      const forms = [...document.forms].map(f => ({
+        action: f.action || "",
+        method: (f.method || "GET").toUpperCase(),
+        inputs: [...f.elements].map(e => ({
+          tag: e.tagName,
+          type: e.type || "",
+          name: e.name || "",
+          value: e.value || "",
+          checked: !!e.checked
+        })).slice(0,200)
+      }));
+
+      const links = [...document.querySelectorAll('a[href]')].map(a => ({
+        text: (a.innerText || a.textContent || "").trim(),
+        href: a.href || ""
+      }));
+
+      const scripts = [...document.scripts].map(s => ({
+        src: s.src || "",
+        text: (s.src ? "" : (s.textContent || "")).slice(0,10000)
+      }));
+
+      const selects = [...document.querySelectorAll('select')].map(s => ({
+        name: s.name || "",
+        id: s.id || "",
+        options: [...s.options].map(o => ({
+          text: (o.textContent || "").trim(),
+          value: o.value || "",
+          selected: !!o.selected
+        }))
+      }));
+
+      return {
+        title: document.title,
+        url: location.href,
+        bodyText: (document.body.innerText || "").slice(0,30000),
+        forms,
+        links,
+        scripts,
+        selects
+      };
+    }
+    """)
+
+    interesting_links = []
+    for item in data.get("links", []):
+        probe = f"{item.get('text','')} {item.get('href','')}".lower()
+        if any(h in probe for h in EXPORT_HINTS + STOCK_HINTS):
+            interesting_links.append(item)
+
+    interesting_scripts = []
+    for item in data.get("scripts", []):
+        probe = f"{item.get('src','')} {item.get('text','')}".lower()
+        if any(h in probe for h in EXPORT_HINTS + STOCK_HINTS):
+            interesting_scripts.append({
+                "src": item.get("src"),
+                "text_excerpt": clean(item.get("text"))[:3000],
+            })
+
+    emit("xml_page_diagnostics", {
+        "url": data.get("url"),
+        "title": data.get("title"),
+        "body_stock_hints": analyze_text_for_stock(data.get("bodyText","")),
+        "forms": data.get("forms", []),
+        "selects": data.get("selects", []),
+        "interesting_links": interesting_links[:100],
+        "interesting_scripts": interesting_scripts[:30],
+    })
+
+    candidates = []
+
+    for item in interesting_links:
+        href = item.get("href") or ""
+        if href and same_host(href):
+            candidates.append(("GET", href, None, "link"))
+
+    for form in data.get("forms", []):
+        action = form.get("action") or data.get("url")
+        method = (form.get("method") or "GET").upper()
+        if not action or not same_host(action):
+            continue
+
+        defaults = {}
+        for inp in form.get("inputs", []):
+            name = inp.get("name") or ""
+            typ = (inp.get("type") or "").lower()
+            if not name:
+                continue
+            if typ in {"checkbox","radio"} and not inp.get("checked"):
+                continue
+            defaults[name] = inp.get("value") or ""
+
+        candidates.append((method, action, defaults, "form_default"))
+
+        # Try exporter select options by substituting one option at a time.
+        for sel in data.get("selects", []):
+            name = sel.get("name") or ""
+            if not name:
+                continue
+            for opt in sel.get("options", []):
+                value = opt.get("value") or ""
+                label = opt.get("text") or ""
+                probe = f"{value} {label}".lower()
+                if any(h in probe for h in EXPORT_HINTS + STOCK_HINTS):
+                    payload = dict(defaults)
+                    payload[name] = value
+                    candidates.append((method, action, payload, f"select:{name}={value}"))
+
+    # Known full XML feed.
+    candidates.append(("GET", urljoin(BASE_URL, KNOWN_XML_FEED), None, "known_xml"))
+
+    deduped = []
+    seen = set()
+    for method, url, payload, origin in candidates:
+        key = (method, url, json.dumps(payload or {}, sort_keys=True, ensure_ascii=False))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((method, url, payload, origin))
+
+    return deduped[:60]
 
 
 async def main():
     playwright = browser = context = None
     try:
         playwright, browser, context, page = await open_logged_in_page()
+        candidates = await inspect_xml_page(page)
 
-        queue = await discover_links(page, urljoin(BASE_URL, "/pulpit"))
-        for path in ("/xml", "/XML", "/oferta", "/export", "/feed"):
-            queue.append({"url": urljoin(BASE_URL, path), "label": path})
+        emit("stock_probe_start", {
+            "candidate_count": len(candidates),
+        })
 
-        emit("xml_discovery_start", {"candidates_found": len(queue), "candidates": queue[:30]})
+        best_products = []
+        best_url = None
+        best_stock_count = 0
 
-        seen = set()
-        products = []
-        product_keys = set()
-
-        while queue and len(seen) < MAX_CANDIDATES:
-            item = queue.pop(0)
-            url = item["url"]
-            if not url or url in seen:
-                continue
-            seen.add(url)
-
-            result = await fetch(context, url)
+        for method, url, payload, origin in candidates:
+            result = await fetch(context, url, method, payload)
             text = result.get("text") or ""
-            is_xml = looks_like_xml_catalog(text)
+            ctype = (result.get("content_type") or "").lower()
+            hints = analyze_text_for_stock(text)
 
-            emit("xml_candidate", {
+            emit("stock_probe_candidate", {
+                "origin": origin,
+                "method": method,
                 "url": url,
-                "label": item.get("label"),
                 "status": result.get("status"),
                 "content_type": result.get("content_type"),
                 "bytes": len(text),
-                "looks_like_xml_catalog": is_xml,
+                "stock_hints": hints,
             })
 
-            if result.get("ok") and is_xml:
-                try:
-                    root = ET.fromstring(text)
-                except ET.ParseError as exc:
-                    emit("xml_parse_error", {"url": url, "error": str(exc)[:300]})
+            low = text[:20000].lower()
+            looks_xml = (
+                text.lstrip().startswith("<")
+                and sum(h in low for h in ("<product","<item","<offer","<towar","<produkt","<name","<nazwa","<sku","<ean")) >= 2
+            )
+
+            if not result.get("ok") or not looks_xml:
+                continue
+
+            try:
+                root = ET.fromstring(text)
+            except ET.ParseError:
+                continue
+
+            elems = choose_product_elements(root)
+            products = []
+            stock_count = 0
+
+            for _, flat in elems:
+                p = normalize(flat, result.get("url") or url)
+                if not (p["title"] or p["supplier_sku"] or p["ean"]):
                     continue
+                products.append(p)
+                if p["stock_qty"] is not None:
+                    stock_count += 1
 
-                elems = choose_product_elements(root)
-                emit("xml_schema", {
-                    "url": result.get("url") or url,
-                    "root_tag": local_name(root.tag),
-                    "candidate_elements": len(elems),
-                })
+            emit("stock_probe_xml_result", {
+                "url": result.get("url") or url,
+                "products": len(products),
+                "products_with_stock": stock_count,
+                "sample_stock": [
+                    {
+                        "sku": p.get("supplier_sku"),
+                        "stock_qty": p.get("stock_qty"),
+                        "stock_raw": p.get("stock_raw"),
+                    }
+                    for p in products if p.get("stock_qty") is not None
+                ][:10],
+            })
 
-                for _, flat in elems[:MAX_PRODUCTS]:
-                    p = normalize(flat, result.get("url") or url)
-                    if not (p["title"] or p["supplier_sku"] or p["ean"]):
-                        continue
-                    if p["wholesale_price_pln"] is None and p["stock_qty"] is None:
-                        continue
+            if len(products) > len(best_products) or stock_count > best_stock_count:
+                best_products = products
+                best_url = result.get("url") or url
+                best_stock_count = stock_count
 
-                    key = (p["supplier_sku"], p["ean"], p["title"], p["source_url"])
-                    if key in product_keys:
-                        continue
-                    product_keys.add(key)
-                    products.append(p)
-                    emit("product", {"product": p})
-
-                if products:
-                    emit("crawl_summary", {
-                        "ok": True,
-                        "mode": "xml",
-                        "xml_feed_url": result.get("url") or url,
-                        "xml_candidates_checked": len(seen),
-                        "products_found": len(products),
-                        "products_with_sku": sum(bool(p["supplier_sku"]) for p in products),
-                        "products_with_ean": sum(bool(p["ean"]) for p in products),
-                        "products_with_price": sum(p["wholesale_price_pln"] is not None for p in products),
-                        "products_with_stock": sum(p["stock_qty"] is not None for p in products),
-                        "zero_stock_products": sum(p["stock_qty"] == 0 for p in products),
-                    })
-                    return
-
-            if result.get("ok") and "html" in (result.get("content_type") or "").lower():
-                for extra in await discover_links(page, result.get("url") or url):
-                    if extra["url"] not in seen:
-                        queue.append(extra)
+        if best_products:
+            for p in best_products:
+                emit("product", {"product": p})
 
         emit("crawl_summary", {
-            "ok": False,
-            "mode": "xml",
-            "xml_candidates_checked": len(seen),
-            "products_found": len(products),
-            "reason": "No parseable product XML feed found",
+            "ok": bool(best_products),
+            "mode": "stock-discovery",
+            "best_feed_url": best_url,
+            "products_found": len(best_products),
+            "products_with_stock": best_stock_count,
+            "stock_source_found": best_stock_count > 0,
         })
 
     except Exception as exc:
         emit("crawl_fatal", {
             "ok": False,
-            "mode": "xml",
+            "mode": "stock-discovery",
             "error_type": type(exc).__name__,
             "error": str(exc)[:500],
         })
