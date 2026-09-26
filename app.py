@@ -655,3 +655,13 @@ async def crawl_status(
         "ok": True,
         "state": _crawl_state,
     }
+
+
+# ---------------------------------------------------------
+# OPTIONAL ONE-SHOT CRAWL ON SERVICE START
+# ---------------------------------------------------------
+
+@app.on_event("startup")
+async def optional_crawl_on_start():
+    if os.getenv("MAKANU_CRAWL_ON_START", "0") == "1":
+        asyncio.create_task(_run_catalog_crawl())
