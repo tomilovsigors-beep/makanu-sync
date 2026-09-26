@@ -14,6 +14,7 @@ TARGETS = [
     "/products/",
     "/products?mi=1041",
     "/products/yak/odziez-kajakowa?page=1&perpage=30&so=Code",
+    "/products/crewsaver/buty?page=1&perpage=30&so=Code",
 ]
 
 HINTS = (
@@ -142,7 +143,7 @@ async def main():
 
             # Extract product cards around Makanu availability icons.
             # s_duzo.png = in stock; s_brak.png = out of stock.
-            if "/products/yak/odziez-kajakowa" in path:
+            if "/products/yak/odziez-kajakowa" in path or "/products/crewsaver/buty" in path:
                 cards = await page.evaluate("""
                 () => {
                   const icons = [...document.querySelectorAll('img[src*="s_duzo.png"], img[src*="s_brak.png"]')];
@@ -203,12 +204,14 @@ async def main():
                     if key in seen_cards:
                         continue
                     seen_cards.add(key)
-                    emit("yak_product", {
-                        "category": "YAK / odziez-kajakowa",
+                    is_yak = "/products/yak/odziez-kajakowa" in path
+                    emit("yak_product" if is_yak else "crewsaver_boot_product", {
+                        "category": "YAK / odziez-kajakowa" if is_yak else "Crewsaver / buty",
                         **card,
                     })
 
-                emit("yak_category_summary", {
+                is_yak = "/products/yak/odziez-kajakowa" in path
+                emit("yak_category_summary" if is_yak else "crewsaver_boot_category_summary", {
                     "url": url,
                     "products_found": len(seen_cards),
                     "in_stock": sum(1 for x in cards if x.get("stock_status") == "in_stock"),
