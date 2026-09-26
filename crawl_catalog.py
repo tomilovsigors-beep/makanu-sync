@@ -13,6 +13,7 @@ NETWORK_IDLE_TIMEOUT_MS = int(os.getenv("MAKANU_CRAWL_NETWORK_IDLE_TIMEOUT_MS", 
 TARGETS = [
     "/products/",
     "/products?mi=1041",
+    "/products/yak/odziez-kajakowa?page=1&perpage=30&so=Code",
 ]
 
 HINTS = (
@@ -138,6 +139,81 @@ async def main():
                 "links": data.get("links", []),
                 "scripts": [str(x)[:8000] for x in data.get("scripts", [])],
             })
+
+            # Extract product cards around Makanu availability icons.
+            # s_duzo.png = in stock; s_brak.png = out of stock.
+            if "/products/yak/odziez-kajakowa" in path:
+                cards = await page.evaluate("""
+                () => {
+                  const icons = [...document.querySelectorAll('img[src*="s_duzo.png"], img[src*="s_brak.png"]')];
+
+                  function clean(v) {
+                    return (v || '').replace(/\\s+/g, ' ').trim();
+                  }
+
+                  function pickContainer(el) {
+                    let cur = el;
+                    for (let i = 0; i < 8 && cur; i++, cur = cur.parentElement) {
+                      const links = cur.querySelectorAll ? cur.querySelectorAll('a[href]') : [];
+                      const imgs = cur.querySelectorAll ? cur.querySelectorAll('img[src]') : [];
+                      const txt = clean(cur.innerText || cur.textContent || '');
+                      if (links.length >= 1 && imgs.length >= 1 && txt.length >= 8 && txt.length <= 2500) {
+                        return cur;
+                      }
+                    }
+                    return el.parentElement || el;
+                  }
+
+                  return icons.map(icon => {
+                    const box = pickContainer(icon);
+                    const links = [...box.querySelectorAll('a[href]')];
+                    const productLink = links.find(a => /\\/product|\\/produkt|\\/p\\//i.test(a.getAttribute('href') || ''))
+                      || links.find(a => clean(a.innerText || a.textContent).length > 2)
+                      || links[0];
+
+                    const allImgs = [...box.querySelectorAll('img[src]')]
+                      .map(i => i.src)
+                      .filter(src => src && !/s_duzo\\.png|s_brak\\.png/i.test(src));
+
+                    const text = clean(box.innerText || box.textContent || '');
+                    const href = productLink ? productLink.href : '';
+                    const linkText = productLink ? clean(productLink.innerText || productLink.textContent || '') : '';
+                    const iconSrc = icon.src || '';
+
+                    return {
+                      stock_status: /s_duzo\\.png/i.test(iconSrc) ? 'in_stock' : 'out_of_stock',
+                      stock_qty: /s_duzo\\.png/i.test(iconSrc) ? 1 : 0,
+                      availability_icon: iconSrc,
+                      title: linkText || text.slice(0, 300),
+                      text: text.slice(0, 1200),
+                      source_url: href,
+                      image_urls: [...new Set(allImgs)].slice(0, 20)
+                    };
+                  });
+                }
+                """)
+
+                seen_cards = set()
+                for card in cards:
+                    key = (
+                        card.get("source_url", ""),
+                        card.get("title", ""),
+                        card.get("availability_icon", ""),
+                    )
+                    if key in seen_cards:
+                        continue
+                    seen_cards.add(key)
+                    emit("yak_product", {
+                        "category": "YAK / odziez-kajakowa",
+                        **card,
+                    })
+
+                emit("yak_category_summary", {
+                    "url": url,
+                    "products_found": len(seen_cards),
+                    "in_stock": sum(1 for x in cards if x.get("stock_status") == "in_stock"),
+                    "out_of_stock": sum(1 for x in cards if x.get("stock_status") == "out_of_stock"),
+                })
 
         emit("crawl_summary", {
             "ok": True,
